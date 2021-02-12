@@ -1,0 +1,386 @@
+---
+title: "Introduction to GDSC data"
+author: "Ricardo Ramirez"
+date: "1/14/2020"
+output: html_document
+---
+
+# Introduction
+
+Here we will work with a reduced dataset coming from the Genomics of Drug Sensitivity in Cancer panel from Sanger Institute.
+
+In this notebook we will apply some basic transcriptomics analysis, functional genomics and network biology concepts to answer questions around drug sensitivity in colon cancer.
+
+#### First make sure to install all required dependencies
+
+```{r setup, include=TRUE, message=FALSE,warning=F}
+# If not installed, follow:
+# install.packages("package")
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(curl)
+library(devtools)
+library(ggplot2)
+library(corrplot)
+# From Bioconductor
+# If not installed, follow:
+# BiocManager::install("package")
+library(viper)
+library(progeny)
+library(fgsea)
+```
+
+#### Then load all datasets needed for this practical
+
+```{r}
+colon_cells <- readRDS("data/colon_cells.rds")
+colon_IC50s <- readRDS(file = "data/colon_IC50s.rds") %>%
+  dplyr::filter(DATASET == "GDSC1") %>%
+  dplyr::mutate(COSMIC_ID = as.character(COSMIC_ID),
+                DRUG_ID = as.character(DRUG_ID)) %>%
+  dplyr::select(COSMIC_ID, DRUG_ID, DRUG_NAME, IC50_PUBLISHED)
+  
+colon_gex <- readRDS(file = "data/colon_gex.rds")
+load("data/TEDDY_geneSets.ro")
+
+hmarks_gsets <- TEDDY_geneSets$MSIGDB_HMARKS
+```
+
+#### Part 1: Data visualization and understanding the data
+
+Let's discuss what type of analyses shall we perform before
+
+```{r}
+hist(colon_IC50s$IC50_PUBLISHED,breaks = 30)
+min(colon_IC50s$IC50_PUBLISHED)
+max(colon_IC50s$IC50_PUBLISHED)
+colon_IC50s$logIC50 <- log10(colon_IC50s$IC50_PUBLISHED)
+hist(colon_IC50s$logIC50)
+```
+What is the most effective drug?
+
+```{r}
+ggplot(colon_IC50s, aes(y = DRUG_ID, 
+                        x = logIC50)) +
+  geom_boxplot() 
+
+```
+
+```{r}
+drug_responses_stats <- colon_IC50s %>% 
+  dplyr::group_by(DRUG_ID) %>%
+  summarise(mean_ic50 = mean(logIC50, na.rm = TRUE),
+            var_ic50 = var(logIC50, na.rm = TRUE)) 
+
+ggplot(drug_responses_stats, aes(x = mean_ic50, y = var_ic50)) +
+  geom_point()
+```
+
+I will select a drug that shows high variability of response
+
+```{r}
+drug_responses_stats %>%
+  dplyr::filter(mean_ic50 > 2) %>%
+  dplyr::arrange(-var_ic50) %>%
+  slice(1) %>%
+  pull(DRUG_ID)
+```
+
+Another question to the data, do cells group similarly from gene expression data and their drug response
+
+```{r}
+colon_IC50s_mat <- colon_IC50s %>%
+  dplyr::select(COSMIC_ID, DRUG_ID, logIC50) %>%
+  tidyr::pivot_wider(values_from = logIC50,
+                     names_from = COSMIC_ID)
+
+drug_rows <- colon_IC50s_mat$DRUG_ID
+colon_IC50s_mat <- as.matrix(colon_IC50s_mat[,-1])
+rownames(colon_IC50s_mat) <- drug_rows
+
+cor_mat <- cor(colon_IC50s_mat, use = "pairwise.complete.obs")
+cor_mat <- na.omit(cor_mat)
+
+corrplot(cor_mat,method = "color",order = "hclust")
+```
+
+Let's go back to our favorite drug. I want to know what explains the variability of responses to hopefully identify a gene that can be targeted to increase the effectiveness of treatment
+
+```{r}
+bleomycin_IC50s <- colon_IC50s %>% dplyr::filter(DRUG_ID == "1017",
+                                                COSMIC_ID %in% colon_cells$COSMIC_ID)
+
+# Here I filter my cell table to contain only cell lines that were treated with my selected drug
+bleomycin_cells <- colon_cells %>% 
+  dplyr::mutate(COSMIC_ID = as.character(COSMIC_ID)) %>%
+  dplyr::filter(COSMIC_ID %in% bleomycin_IC50s$COSMIC_ID)
+  
+# Here I add the IDs from my expression matrix to my drug response data
+bleomycin_IC50s <- left_join(bleomycin_IC50s, bleomycin_cells[,c("DepMap_ID", "COSMIC_ID")])
+# Same order of IC50s and gene expression
+colon_gex_filtered <- colon_gex[,bleomycin_IC50s$DepMap_ID]
+# Filter genes that have more than 50% of data == 0 
+good_rows <- rowSums(colon_gex_filtered == 0) < 
+            (ncol(colon_gex_filtered))/2
+# Final GEX matrix
+colon_gex_filtered <- colon_gex_filtered[good_rows,]
+genes <- rownames(colon_gex_filtered)
+```
+
+1) After what you heard of this dataset, what type of questions could be solved and why network biology + systems biology is useful here? 
+
+# Gene analysis / Gene set enrichment analysis
+
+1) Get one drug to test for responses
+
+```{r}
+# Here we perform a linear model of DrugResponse~GeneExpression
+# Remember that this is an example and many assumptions have to be
+# done to the data!! Don't forget your stats course :-)
+
+lm_summary = data.frame(t(sapply(genes,function(gene){
+       modelDF = tibble("Expression" = colon_gex_filtered[gene,],
+                        "Response" = bleomycin_IC50s$logIC50)
+       
+       lmres = lm(Response~Expression,data = modelDF)
+       lmres = summary(lmres)$coefficients[2,c(3,4)]
+       names(lmres) = c("t","p_value")
+       
+       return(lmres)
+})))
+
+lm_summary = lm_summary %>% 
+             mutate("gene" = rownames(lm_summary),
+                    "adj_pval" = p.adjust(p_value,"BH")) %>%
+             arrange(desc(t))
+
+dim(lm_summary)
+
+head(lm_summary)
+
+pval_sign = lm_summary %>%
+            filter(adj_pval < 0.05) %>%
+  as_tibble()
+```
+
+2) OK we can make plots just to understand what's happening
+
+- A positive slope would represent that the expression of the genes contribute to resistance
+
+```{r}
+plot(colon_gex_filtered["ARRDC1",],
+     bleomycin_IC50s$logIC50)
+```
+
+```{r}
+plot(lm_summary[,"t"],
+     -log10(lm_summary[,"adj_pval"]))
+```
+
+
+3) What if we wanted to know which processes are involved in resistance?
+
+```{r}
+## Function to perform Hypergeometric Tests for gene set enrichment 
+## Input:
+## geneList = query gene list to enrich
+## Annotation_DB = a list of gene sets to enrich in geneList
+## Output: data frame with results
+
+GSE_analysis = function(geneList,Annotation_DB){
+  
+  geneList = geneList[geneList %in% unique(unlist(Annotation_DB))]
+  
+  ResultsDF = matrix(0,nrow = length(Annotation_DB),ncol = 5)
+  rownames(ResultsDF) = names(Annotation_DB)
+  colnames(ResultsDF) = c("GenesInPathway","GenesInList","GeneNames","p_value","corr_p_value")
+  
+  DB_genecontent = length(unique(unlist(Annotation_DB)))
+  
+  GenesDB = DB_genecontent 
+  SelectedGenes = length(geneList)
+  
+  for(gset in rownames(ResultsDF)){
+    GP = length(Annotation_DB[[gset]])
+    GL = length(intersect(Annotation_DB[[gset]],geneList))
+    
+    ResultsDF[gset,"GenesInList"] = GL
+    ResultsDF[gset,"GenesInPathway"] = GP
+    ResultsDF[gset,"GeneNames"] = paste(intersect(Annotation_DB[[gset]],geneList),collapse = ",")
+    #ResultsDF[gset,"p_value"] = HypergeometricTest(overRepres = TRUE,N = N,K = K,n = n,k = k)
+    ResultsDF[gset,"p_value"] = phyper(q=GL - 1, m=GP, n=GenesDB-GP, k=SelectedGenes, lower.tail = FALSE, log.p = FALSE)
+  }
+  
+  ResultsDF[,"corr_p_value"] = p.adjust(ResultsDF[,"p_value"],method = "BH")
+  ResultsDF = data.frame(ResultsDF,stringsAsFactors = F)
+  ResultsDF = ResultsDF[order(ResultsDF[,"p_value"]),]
+  
+  return(ResultsDF)
+  
+}
+```
+
+
+```{r}
+# Overrepresentation analysis for homework ;)
+# Look for hypergeometric tests
+
+resistance_genes <- pval_sign %>%
+  dplyr::filter(t > 0) %>%
+  pull(gene)
+
+sensitivity_genes <-  pval_sign %>%
+  dplyr::filter(t < 0) %>%
+  pull(gene)
+  
+fisher_pvals = GSE_analysis(geneList = resistance_genes,
+             Annotation_DB = hmarks_gsets)
+
+fisher_pvals = GSE_analysis(geneList = sensitivity_genes,
+             Annotation_DB = hmarks_gsets)
+
+# Let's apply GSEA
+t_vals = lm_summary$t
+names(t_vals) = lm_summary$gene
+
+enrichment_res = fgsea(hmarks_gsets, 
+                       stats = t_vals)
+
+# Let's look at the results
+
+enrichment_res = data.frame(enrichment_res) %>%
+                 arrange(desc(abs(NES)))
+
+enrichment_res_filtered = enrichment_res %>%
+                          dplyr::filter(pval<0.05)
+
+enrichment_res_filtered[1:5,-8]
+```
+
+# TF activities
+
+```{r}
+## We read Dorothea Regulons for Human:
+## We obtain the regulons based on interactions with confidence level A, B and C
+
+data(dorothea_hs, package = "dorothea")
+regulons = dorothea_hs
+
+regulon = regulons %>%
+    dplyr::filter(confidence %in% c("A","B","C")) %>%
+    dorothea::df2regulon()
+
+```
+
+#### Getting TF activities and associations with drug response
+
+```{r}
+# Running viper
+colon_tfs = viper(eset = colon_gex_filtered,
+                  regulon = regulon,
+                  verbose = F)
+dim(colon_tfs)
+tfs = rownames(colon_tfs)
+
+#Running linear models
+tfs_lm_summary = data.frame(t(sapply(tfs,function(tf){
+       modelDF = tibble("Expression" = colon_tfs[tf,],
+                        "Response" = bleomycin_IC50s$logIC50)
+       
+       lmres = lm(Response~Expression,data = modelDF)
+       lmres = summary(lmres)$coefficients[2,c(3,4)]
+       names(lmres) = c("t","p_value")
+       
+       return(lmres)
+})))
+
+tfs_lm_summary = tfs_lm_summary %>% 
+                 mutate("TF" = rownames(tfs_lm_summary),
+                        "adj_pval" = p.adjust(p_value,"BH")) %>%
+                 
+                 arrange(desc(t)) %>%
+                 dplyr::filter(p_value<0.05)
+
+dim(tfs_lm_summary)
+
+head(tfs_lm_summary)
+```
+
+```{r}
+plot(colon_tfs["KLF5",],
+     bleomycin_IC50s$logIC50)
+```
+
+
+```{r}
+plot(colon_tfs["KLF6",],
+     bleomycin_IC50s$logIC50)
+```
+
+
+```{r}
+plot(colon_tfs["SNAI2",],
+     bleomycin_IC50s$logIC50)
+```
+
+# PROGENy
+
+1) What's the difference between this approach and GSEA?
+
+#### Here we first calculate pathway activities and then we associate them with drug response
+
+```{r}
+progeny_colon = t(progeny(expr = colon_gex_filtered))
+progeny_colon[1:5,1:5]
+
+pathways = rownames(progeny_colon)
+
+path_lm_summary = data.frame(t(sapply(pathways,function(pathway){
+       modelDF = tibble("Expression" = progeny_colon[pathway,],
+                        "Response" = bleomycin_IC50s$logIC50)
+       
+       lmres = lm(Response~Expression,data = modelDF)
+       lmres = summary(lmres)$coefficients[2,c(3,4)]
+       names(lmres) = c("t","p_value")
+       
+       return(lmres)
+})))
+
+path_lm_summary = path_lm_summary %>% 
+                 mutate("Pathway" = rownames(path_lm_summary),
+                        "adj_pval" = p.adjust(p_value,"BH")) %>%
+                 arrange(desc(t)) %>%
+                 dplyr::filter(p_value<0.1)
+
+dim(path_lm_summary)
+
+path_lm_summary
+```
+
+
+```{r}
+plot(progeny_colon["PI3K",],
+     bleomycin_IC50s$logIC50)
+```
+
+#### Comparison with GSEA
+
+```{r}
+enrichment_res_filtered$pathway
+```
+
+
+```{r}
+sort(names(hmarks_gsets)[!names(hmarks_gsets) %in%
+                       enrichment_res_filtered$pathway])
+```
+
+# Session info
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
+
+
+
