@@ -57,7 +57,7 @@ parameters to data and make predictions.
 
 # Dependencies
 
-```{r message=FALSE, warning=FALSE, eval=FALSE}
+```{r message=FALSE, warning=FALSE}
 
 # To install the packages from Bioconductor you will need the package BiocManager
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
